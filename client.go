@@ -2,147 +2,94 @@ package snet
 
 import (
 	"crypto/tls"
-	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-var (
-	ErrClientNotConnected = errors.New("client is not connected")
-	ErrRequestTimeout     = errors.New("request timeout")
-)
-
-// client 客户端实现
-type client struct {
-	address   string
-	tlsConfig *tls.Config
-	conn      *Connection
-	mu        sync.RWMutex
-	connected int32
-	responses sync.Map
-	sequence  uint32
+// Client TCP客户端
+type Client struct {
+	conn      *Conn
+	addr      string
+	seq       uint32
+	mu        sync.Mutex
+	connected bool
 }
 
-// newClient 创建新客户端
-func newClient(address string, tlsConfig *tls.Config) *client {
-	return &client{
-		address:   address,
-		tlsConfig: tlsConfig,
-		connected: 0,
-		sequence:  0,
+// NewClient 创建客户端
+func NewClient(addr string) *Client {
+	return &Client{
+		addr: addr,
+		seq:  0,
 	}
 }
 
 // Connect 连接服务器
-func (c *client) Connect() error {
+func (c *Client) Connect() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if atomic.LoadInt32(&c.connected) == 1 {
-		return nil
+	if c.connected {
+		return fmt.Errorf("client already connected")
 	}
-
-	// 建立连接
-	conn, err := net.Dial("tcp", c.address)
+	var err error
+	var conn net.Conn
+	if clientAuthConfig != nil {
+		conn, err = tls.Dial("tcp", c.addr, clientAuthConfig)
+	} else {
+		conn, err = net.Dial("tcp", c.addr)
+	}
 	if err != nil {
 		return err
 	}
 
-	// 包装TLS
-	tlsConn, err := wrapTLS(conn, c.tlsConfig, false)
-	if err != nil {
-		conn.Close()
-		return err
-	}
-
-	c.conn = NewConnection(tlsConn, 30*time.Second, 30*time.Second)
-	atomic.StoreInt32(&c.connected, 1)
-
-	// 启动响应处理协程
-	go c.handleResponses()
+	c.conn = newConn(conn)
+	c.connected = true
 
 	return nil
 }
 
-// handleResponses 处理响应
-func (c *client) handleResponses() {
-	for atomic.LoadInt32(&c.connected) == 1 {
-		msg, err := c.conn.ReadMessage()
-		if err != nil {
-			break
-		}
-
-		// 查找等待的响应通道
-		if ch, exists := c.responses.LoadAndDelete(msg.ID); exists {
-			if responseChan, ok := ch.(chan *Message); ok {
-				select {
-				case responseChan <- msg:
-				default:
-				}
-			}
-		}
-	}
-}
-
-// Send 发送消息（无响应）
-func (c *client) Send(msgID uint32, data interface{}) error {
-	if atomic.LoadInt32(&c.connected) == 0 {
-		return ErrClientNotConnected
-	}
-
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	return c.conn.SendMessage(msgID, data)
-}
-
-// SendWithResponse 发送消息并等待响应
-func (c *client) SendWithResponse(msgID uint32, data interface{}, timeout time.Duration) (*Message, error) {
-	if atomic.LoadInt32(&c.connected) == 0 {
-		return nil, ErrClientNotConnected
-	}
-
-	// 生成序列号
-	sequence := atomic.AddUint32(&c.sequence, 1)
-	responseID := msgID + sequence
-
-	// 创建响应通道
-	responseChan := make(chan *Message, 1)
-	c.responses.Store(responseID, responseChan)
-	defer c.responses.Delete(responseID)
-
-	// 发送消息
-	c.mu.RLock()
-	err := c.conn.SendMessage(responseID, data)
-	c.mu.RUnlock()
-
-	if err != nil {
-		return nil, err
-	}
-
-	// 等待响应
-	select {
-	case response := <-responseChan:
-		return response, nil
-	case <-time.After(timeout):
-		return nil, ErrRequestTimeout
-	}
-}
-
-// Close 关闭客户端
-func (c *client) Close() error {
-	if !atomic.CompareAndSwapInt32(&c.connected, 1, 0) {
-		return nil
-	}
-
+// Send 发送数据
+func (c *Client) Send(dataType uint8, data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.conn != nil {
+	if !c.connected {
+		return fmt.Errorf("client not connected")
+	}
+
+	seq := atomic.AddUint32(&c.seq, 1)
+	packet := NewPacket(dataType, data, seq)
+	return c.conn.SendPacket(packet)
+}
+
+// Receive 接收数据
+func (c *Client) Receive() (*Packet, error) {
+	if !c.connected {
+		return nil, fmt.Errorf("client not connected")
+	}
+
+	return c.conn.ReceivePacket()
+}
+
+// Close 关闭连接
+func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.connected {
+		c.connected = false
 		return c.conn.Close()
 	}
 
 	return nil
+}
+
+// SetTimeout 设置超时
+func (c *Client) SetTimeout(readTimeout, writeTimeout time.Duration) {
+	if c.conn != nil {
+		c.conn.SetTimeout(readTimeout, writeTimeout)
+	}
 }
