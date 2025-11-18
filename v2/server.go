@@ -1,212 +1,209 @@
 package v2
 
 import (
-	"context"
 	"crypto/tls"
-	"errors"
-	"io"
+	"fmt"
 	"net"
 	"sync"
-	"sync/atomic"
-	"time"
 )
 
-// ServerConfig 服务器配置
-type ServerConfig struct {
-	Network        string        // 网络类型 tcp/tcp4/tcp6
-	Addr           string        // 监听地址
-	MaxConnections int           // 最大连接数
-	WorkerCount    int           // 工作协程数
-	QueueSize      int           // 任务队列大小
-	ReadTimeout    time.Duration // 读超时
-	WriteTimeout   time.Duration // 写超时
-	TLSConfig      *tls.Config   // TLS配置
-	EnableTLS      bool          // 是否启用TLS
-	CertFile       string        // 证书文件
-	KeyFile        string        // 私钥文件
+// Server 服务器
+type Server struct {
+	Name        string
+	IPVersion   string
+	IP          string
+	Port        int
+	workerPool  WorkerPool
+	router      *Router
+	connMgr     *ConnectionManager
+	serializer  Serializer
+	tlsConfig   *tls.Config
+	onConnStart func(conn Connection)
+	onConnStop  func(conn Connection)
+	sync.RWMutex
 }
 
-// server TCP服务器
-type server struct {
-	config      *ServerConfig
-	listener    net.Listener
-	handler     Handler
-	pool        Pool
-	wg          sync.WaitGroup
-	mu          sync.RWMutex
-	connections map[net.Conn]struct{}
-	closed      int32
-	ctx         context.Context
-	cancel      context.CancelFunc
+// ConnectionManager 连接管理器
+type ConnectionManager struct {
+	connections map[uint32]Connection
+	sync.RWMutex
 }
 
-// NewServer 创建新的TCP服务器
-func NewServer(config *ServerConfig) Server {
-	if config == nil {
-		config = &ServerConfig{
-			Network:        "tcp",
-			MaxConnections: 10000,
-			WorkerCount:    100,
-			QueueSize:      1000,
-			ReadTimeout:    30 * time.Second,
-			WriteTimeout:   30 * time.Second,
+// NewConnectionManager 创建连接管理器
+func NewConnectionManager() *ConnectionManager {
+	return &ConnectionManager{
+		connections: make(map[uint32]Connection),
+	}
+}
+
+func (cm *ConnectionManager) Add(conn Connection) {
+	cm.Lock()
+	defer cm.Unlock()
+	cm.connections[conn.GetConnID()] = conn
+}
+
+func (cm *ConnectionManager) Remove(connID uint32) {
+	cm.Lock()
+	defer cm.Unlock()
+	delete(cm.connections, connID)
+}
+
+func (cm *ConnectionManager) Get(connID uint32) (Connection, bool) {
+	cm.RLock()
+	defer cm.RUnlock()
+	conn, ok := cm.connections[connID]
+	return conn, ok
+}
+
+func (cm *ConnectionManager) Len() int {
+	cm.RLock()
+	defer cm.RUnlock()
+	return len(cm.connections)
+}
+
+func (cm *ConnectionManager) Clear() {
+	cm.Lock()
+	defer cm.Unlock()
+	for connID, conn := range cm.connections {
+		conn.Stop()
+		delete(cm.connections, connID)
+	}
+}
+
+// Server配置
+type Config struct {
+	Name           string
+	Host           string
+	Port           int
+	WorkerNum      int
+	MaxWorkerTask  int
+	MaxConn        int
+	UseTLS         bool
+	CertFile       string
+	KeyFile        string
+	ClientAuthType tls.ClientAuthType
+}
+
+// NewServer 创建服务器
+func NewServer(config *Config) *Server {
+	s := &Server{
+		Name:       config.Name,
+		IPVersion:  "tcp4",
+		IP:         config.Host,
+		Port:       config.Port,
+		router:     NewRouter(),
+		connMgr:    NewConnectionManager(),
+		serializer: NewJSONSerializer(),
+	}
+
+	// 初始化工作池
+	if config.WorkerNum > 0 {
+		s.workerPool = NewWorkerPool(config.WorkerNum, config.MaxWorkerTask)
+	}
+
+	// 配置TLS
+	if config.UseTLS {
+		cert, err := tls.LoadX509KeyPair(config.CertFile, config.KeyFile)
+		if err != nil {
+			panic(err)
+		}
+
+		s.tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			ClientAuth:   config.ClientAuthType,
 		}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	return &server{
-		config:      config,
-		handler:     nil,
-		connections: make(map[net.Conn]struct{}),
-		ctx:         ctx,
-		cancel:      cancel,
-	}
+	return s
 }
 
-func (s *server) Start() error {
+// Start 启动服务器
+func (s *Server) Start() {
+	fmt.Printf("[SNET] Server starting at %s:%d\n", s.IP, s.Port)
+
+	// 启动工作池
+	if s.workerPool != nil {
+		s.workerPool.Start()
+	}
+
+	// 解析地址
+	addr, err := net.ResolveTCPAddr(s.IPVersion, fmt.Sprintf("%s:%d", s.IP, s.Port))
+	if err != nil {
+		panic(err)
+	}
+
+	// 监听端口
 	var listener net.Listener
-	var err error
-
-	// 创建监听器
-	if s.config.EnableTLS {
-		if s.config.TLSConfig == nil {
-			cert, err := tls.LoadX509KeyPair(s.config.CertFile, s.config.KeyFile)
-			if err != nil {
-				return err
-			}
-			s.config.TLSConfig = &tls.Config{
-				Certificates: []tls.Certificate{cert},
-				ClientAuth:   tls.RequireAndVerifyClientCert,
-			}
-		}
-		listener, err = tls.Listen(s.config.Network, s.config.Addr, s.config.TLSConfig)
+	if s.tlsConfig != nil {
+		listener, err = tls.Listen(s.IPVersion, addr.String(), s.tlsConfig)
 	} else {
-		listener, err = net.Listen(s.config.Network, s.config.Addr)
+		listener, err = net.ListenTCP(s.IPVersion, addr)
 	}
 
 	if err != nil {
-		return err
+		panic(err)
 	}
 
-	s.listener = listener
-	s.pool = NewWorkerPool(s.config.WorkerCount, s.config.QueueSize)
-
-	s.wg.Add(1)
-	go s.acceptLoop()
-
-	return nil
-}
-
-func (s *server) Stop() error {
-	if !atomic.CompareAndSwapInt32(&s.closed, 0, 1) {
-		return nil
-	}
-
-	s.cancel()
-
-	if s.listener != nil {
-		s.listener.Close()
-	}
-
-	if s.pool != nil {
-		s.pool.Release()
-	}
-
-	s.mu.Lock()
-	for conn := range s.connections {
-		conn.Close()
-	}
-	s.connections = make(map[net.Conn]struct{})
-	s.mu.Unlock()
-
-	s.wg.Wait()
-	return nil
-}
-
-func (s *server) RegisterHandler(handler Handler) {
-	s.handler = handler
-}
-
-func (s *server) acceptLoop() {
-	defer s.wg.Done()
-
+	var connID uint32
 	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		default:
-		}
-
-		conn, err := s.listener.Accept()
+		// 接受连接
+		conn, err := listener.Accept()
 		if err != nil {
-			if atomic.LoadInt32(&s.closed) == 1 {
-				return
-			}
+			fmt.Printf("Accept err: %v\n", err)
 			continue
 		}
 
-		s.mu.Lock()
-		if len(s.connections) >= s.config.MaxConnections {
+		// 限制最大连接数
+		if s.connMgr.Len() >= 10000 { // 可根据配置调整
 			conn.Close()
-			s.mu.Unlock()
 			continue
 		}
-		s.connections[conn] = struct{}{}
-		s.mu.Unlock()
 
-		s.wg.Add(1)
-		go s.handleConnection(conn)
+		connID++
+		dealConn := NewConnection(s, conn, connID)
+
+		s.connMgr.Add(dealConn)
+		go dealConn.Start()
 	}
 }
 
-func (s *server) handleConnection(netConn net.Conn) {
-	defer func() {
-		netConn.Close()
-		s.mu.Lock()
-		delete(s.connections, netConn)
-		s.mu.Unlock()
-		s.wg.Done()
-	}()
+// Stop 停止服务器
+func (s *Server) Stop() {
+	fmt.Println("[SNET] Server stopping...")
 
-	conn := newConn(netConn)
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		default:
-		}
-
-		data, err := conn.Read()
-		if err != nil {
-			if err != io.EOF && !errors.Is(err, net.ErrClosed) {
-				// 记录错误日志
-			}
-			return
-		}
-
-		if s.handler != nil {
-			// 提交任务到协程池
-			task := func() {
-				ctx, cancel := context.WithTimeout(s.ctx, s.config.ReadTimeout)
-				defer cancel()
-
-				resp, err := s.handler.Handle(ctx, data)
-				if err != nil {
-					// 记录错误日志
-					return
-				}
-
-				if resp != nil {
-					if err := conn.Write(resp); err != nil {
-						// 记录错误日志
-					}
-				}
-			}
-
-			if err := s.pool.Submit(task); err != nil {
-				// 记录任务提交失败日志
-			}
-		}
+	if s.workerPool != nil {
+		s.workerPool.Stop()
 	}
+
+	s.connMgr.Clear()
+}
+
+// AddRouter 添加路由
+func (s *Server) AddRouter(msgID uint32, handler RouterHandler) {
+	s.router.AddRouter(msgID, handler)
+}
+
+// SetOnConnStart 设置连接开始回调
+func (s *Server) SetOnConnStart(hookFunc func(Connection)) {
+	s.onConnStart = hookFunc
+}
+
+// SetOnConnStop 设置连接结束回调
+func (s *Server) SetOnConnStop(hookFunc func(Connection)) {
+	s.onConnStop = hookFunc
+}
+
+// CallOnConnStart 调用连接开始回调
+func (s *Server) CallOnConnStart(conn Connection) {
+	if s.onConnStart != nil {
+		s.onConnStart(conn)
+	}
+}
+
+// CallOnConnStop 调用连接结束回调
+func (s *Server) CallOnConnStop(conn Connection) {
+	if s.onConnStop != nil {
+		s.onConnStop(conn)
+	}
+	s.connMgr.Remove(conn.GetConnID())
 }

@@ -1,63 +1,77 @@
 package main
 
 import (
-	"context"
+	"fmt"
 	"log"
+	"time"
 
-	v2 "github.com/laazua/snet/v2"
+	"github.com/laazua/snet/v2"
 )
 
-func main() {
-	startServer()
+func main() {}
+
+// 定义业务数据结构
+type LoginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
-// Request 请求结构体
-type Request struct {
-	Action string `json:"action"`
-	Data   any    `json:"data"`
-}
-
-// Response 响应结构体
-type Response struct {
+type LoginResponse struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
-	Data    any    `json:"data"`
+	UserID  int    `json:"user_id"`
 }
 
-// EchoHandler 回显处理器
-type EchoHandler struct{}
+// 登录处理器
+type LoginHandler struct {
+	v2.BaseHandler
+}
 
-func (e EchoHandler) Handle(ctx context.Context, req []byte) ([]byte, error) {
-	var request Request
-	codec := v2.NewDefaultCodec()
-
-	if err := codec.Decode(req, &request); err != nil {
-		return nil, err
+func (h *LoginHandler) Handle(request v2.Request) {
+	// 反序列化数据
+	var loginReq LoginRequest
+	err := request.GetConnection().(*snet.ConnectionImpl).Server.serializer.Deserialize(
+		request.GetMessage().GetData(), &loginReq)
+	if err != nil {
+		log.Printf("Deserialize error: %v", err)
+		return
 	}
 
-	response := Response{
+	fmt.Printf("Received login request: %+v\n", loginReq)
+
+	// 处理业务逻辑
+	response := LoginResponse{
 		Code:    0,
-		Message: "success",
-		Data:    request.Data,
+		Message: "Login successful",
+		UserID:  1001,
 	}
 
-	return codec.Encode(response)
+	// 发送响应
+	request.GetConnection().SendMsgWithStruct(2, response)
 }
 
 func startServer() {
-	config := &v2.ServerConfig{
-		Addr:        ":8080",
-		WorkerCount: 100,
-		QueueSize:   1000,
+	config := &snet.Config{
+		Name:          "TestServer",
+		Host:          "127.0.0.1",
+		Port:          8888,
+		WorkerNum:     100,
+		MaxWorkerTask: 10000,
+		MaxConn:       10000,
+		UseTLS:        false, // 设置为true启用TLS
+		CertFile:      "cert.pem",
+		KeyFile:       "key.pem",
 	}
 
-	server := v2.NewServer(config)
-	server.RegisterHandler(EchoHandler{})
+	server := snet.NewServer(config)
 
-	if err := server.Start(); err != nil {
-		log.Fatal("Server start failed:", err)
-	}
+	// 添加路由
+	loginHandler := &LoginHandler{}
+	server.AddRouter(1, loginHandler)
 
-	log.Println("Server started on :8080")
+	// 启动服务器
+	go server.Start()
 
+	// 等待服务器启动
+	time.Sleep(100 * time.Millisecond)
 }

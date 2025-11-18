@@ -1,147 +1,166 @@
 package v2
 
 import (
-	"bufio"
-	"crypto/tls"
+	"context"
 	"errors"
 	"io"
 	"net"
 	"sync"
-	"time"
 )
 
-var (
-	// ErrConnectionClosed 连接已关闭错误
-	ErrConnectionClosed = errors.New("connection closed")
-	// ErrWriteTimeout 写入超时错误
-	ErrWriteTimeout = errors.New("write timeout")
-)
-
-// conn 连接封装
-type conn struct {
-	netConn    net.Conn
-	reader     *bufio.Reader
-	writer     *bufio.Writer
-	mu         sync.RWMutex
-	closed     bool
-	writeChan  chan *writeRequest
-	closeChan  chan struct{}
-	bufferPool *sync.Pool
+// ConnectionImpl 连接实现
+type ConnectionImpl struct {
+	Server      *Server
+	Conn        net.Conn
+	ConnID      uint32
+	isClosed    bool
+	ctx         context.Context
+	cancel      context.CancelFunc
+	msgChan     chan []byte
+	msgBuffChan chan []byte
+	sync.RWMutex
 }
 
-type writeRequest struct {
-	data []byte
-	err  chan error
-}
-
-// newConn 创建新连接
-func newConn(netConn net.Conn) Conn {
-	c := &conn{
-		netConn:   netConn,
-		reader:    bufio.NewReader(netConn),
-		writer:    bufio.NewWriter(netConn),
-		writeChan: make(chan *writeRequest, 1000),
-		closeChan: make(chan struct{}),
-		bufferPool: &sync.Pool{
-			New: func() interface{} {
-				return make([]byte, 0, 4096)
-			},
-		},
+// NewConnection 创建连接
+func NewConnection(server *Server, conn net.Conn, connID uint32) *ConnectionImpl {
+	c := &ConnectionImpl{
+		Server:      server,
+		Conn:        conn,
+		ConnID:      connID,
+		isClosed:    false,
+		msgChan:     make(chan []byte),
+		msgBuffChan: make(chan []byte, 1024),
 	}
 
-	go c.writeLoop()
+	c.ctx, c.cancel = context.WithCancel(context.Background())
 	return c
 }
 
-// newTLSConn 创建TLS连接
-func newTLSConn(netConn net.Conn, config *tls.Config) (Conn, error) {
-	tlsConn := tls.Client(netConn, config)
-	if err := tlsConn.Handshake(); err != nil {
-		return nil, err
-	}
-	return newConn(tlsConn), nil
+func (c *ConnectionImpl) Start() {
+	go c.startReader()
+	go c.startWriter()
+
+	c.Server.CallOnConnStart(c)
 }
 
-func (c *conn) Read() ([]byte, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+func (c *ConnectionImpl) Stop() {
+	c.Lock()
+	defer c.Unlock()
 
-	if c.closed {
-		return nil, ErrConnectionClosed
+	if c.isClosed {
+		return
 	}
 
-	packet, err := ReadPacket(c.reader)
+	c.Server.CallOnConnStop(c)
+	c.cancel()
+	close(c.msgChan)
+	close(c.msgBuffChan)
+	c.Conn.Close()
+	c.isClosed = true
+}
+
+func (c *ConnectionImpl) Context() context.Context {
+	return c.ctx
+}
+
+func (c *ConnectionImpl) GetConn() net.Conn {
+	return c.Conn
+}
+
+func (c *ConnectionImpl) GetConnID() uint32 {
+	return c.ConnID
+}
+
+func (c *ConnectionImpl) SendMsg(msgID uint32, data []byte) error {
+	c.RLock()
+	defer c.RUnlock()
+
+	if c.isClosed {
+		return errors.New("connection closed")
+	}
+
+	msg := NewMessage(msgID, data)
+	dataPack := NewDataPack()
+	packedData, err := dataPack.Pack(msg)
 	if err != nil {
-		if err == io.EOF {
-			c.close()
-		}
-		return nil, err
+		return err
 	}
 
-	return packet.Data, nil
+	c.msgChan <- packedData
+	return nil
 }
 
-func (c *conn) Write(data []byte) error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	if c.closed {
-		return ErrConnectionClosed
+func (c *ConnectionImpl) SendMsgWithStruct(msgID uint32, data interface{}) error {
+	serializedData, err := c.Server.serializer.Serialize(data)
+	if err != nil {
+		return err
 	}
-
-	req := &writeRequest{
-		data: data,
-		err:  make(chan error, 1),
-	}
-
-	select {
-	case c.writeChan <- req:
-		return <-req.err
-	case <-c.closeChan:
-		return ErrConnectionClosed
-	case <-time.After(5 * time.Second):
-		return ErrWriteTimeout
-	}
+	return c.SendMsg(msgID, serializedData)
 }
 
-func (c *conn) writeLoop() {
+func (c *ConnectionImpl) startReader() {
+	defer c.Stop()
+
+	dataPack := NewDataPack()
+	header := make([]byte, dataPack.GetHeadLen())
+
 	for {
 		select {
-		case req := <-c.writeChan:
-			err := WritePacket(c.writer, req.data)
-			if err == nil {
-				err = c.writer.Flush()
-			}
-			req.err <- err
-			if err != nil {
-				c.close()
+		case <-c.ctx.Done():
+			return
+		default:
+			// 读取头部
+			if _, err := io.ReadFull(c.Conn, header); err != nil {
 				return
 			}
-		case <-c.closeChan:
+
+			// 解析头部
+			msg, err := dataPack.Unpack(header)
+			if err != nil {
+				return
+			}
+
+			// 读取数据体
+			data := make([]byte, msg.GetDataLen())
+			if _, err := io.ReadFull(c.Conn, data); err != nil {
+				return
+			}
+			msg.SetData(data)
+
+			// 提交到工作池处理
+			req := &RequestImpl{
+				conn: c,
+				msg:  msg,
+			}
+
+			if c.Server.workerPool != nil {
+				c.Server.workerPool.Submit(func() {
+					c.Server.router.Handle(req)
+				})
+			} else {
+				go c.Server.router.Handle(req)
+			}
+		}
+	}
+}
+
+func (c *ConnectionImpl) startWriter() {
+	for {
+		select {
+		case data := <-c.msgChan:
+			if _, err := c.Conn.Write(data); err != nil {
+				return
+			}
+		case data, ok := <-c.msgBuffChan:
+			if ok {
+				if _, err := c.Conn.Write(data); err != nil {
+					return
+				}
+			} else {
+				return
+			}
+		case <-c.ctx.Done():
 			return
 		}
 	}
-}
-
-func (c *conn) Close() error {
-	c.close()
-	return c.netConn.Close()
-}
-
-func (c *conn) close() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if !c.closed {
-		c.closed = true
-		close(c.closeChan)
-	}
-}
-
-func (c *conn) LocalAddr() net.Addr {
-	return c.netConn.LocalAddr()
-}
-
-func (c *conn) RemoteAddr() net.Addr {
-	return c.netConn.RemoteAddr()
 }

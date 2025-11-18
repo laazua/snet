@@ -3,53 +3,50 @@ package v2
 import (
 	"context"
 	"net"
-	"time"
 )
 
-// Handler 业务处理接口
-type Handler interface {
-	Handle(ctx context.Context, req []byte) ([]byte, error)
+// Message 消息接口
+type Message interface {
+	GetMsgID() uint32
+	GetData() []byte
+	SetData([]byte)
+	GetDataLen() uint32
 }
 
-// HandlerFunc 业务处理函数类型
-type HandlerFunc func(ctx context.Context, req []byte) ([]byte, error)
-
-func (f HandlerFunc) Handle(ctx context.Context, req []byte) ([]byte, error) {
-	return f(ctx, req)
+// Request 请求接口
+type Request interface {
+	GetConnection() Connection
+	GetMessage() Message
 }
 
-// Codec 编解码器接口
-type Codec interface {
-	Encode(v interface{}) ([]byte, error)
-	Decode(data []byte, v interface{}) error
+// Connection 连接接口
+type Connection interface {
+	Start()
+	Stop()
+	Context() context.Context
+	GetConn() net.Conn
+	GetConnID() uint32
+	SendMsg(msgID uint32, data []byte) error
+	SendMsgWithStruct(msgID uint32, data interface{}) error
 }
 
-// Pool 协程池接口
-type Pool interface {
-	Submit(task func()) error
-	Release()
+// RouterHandler 路由处理器接口
+type RouterHandler interface {
+	PreHandle(request Request)
+	Handle(request Request)
+	PostHandle(request Request)
 }
 
-// Conn 连接接口
-type Conn interface {
-	Read() ([]byte, error)
-	Write(data []byte) error
-	Close() error
-	LocalAddr() net.Addr
-	RemoteAddr() net.Addr
+// DataPack 数据包接口
+type DataPack interface {
+	GetHeadLen() uint32
+	Pack(msg Message) ([]byte, error)
+	Unpack([]byte) (Message, error)
 }
 
-// Server 服务器接口
-type Server interface {
-	Start() error
-	Stop() error
-	RegisterHandler(handler Handler)
-}
-
-// Client 客户端接口
-type Client interface {
-	Connect(addr string) error
-	Close() error
-	Send(req interface{}) ([]byte, error)
-	SendWithTimeout(req interface{}, timeout time.Duration) ([]byte, error)
+// WorkerPool 工作池接口
+type WorkerPool interface {
+	Start()
+	Stop()
+	Submit(task func())
 }
