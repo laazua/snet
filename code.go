@@ -1,7 +1,6 @@
 package snet
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -21,7 +20,9 @@ type decoder interface {
 type defaultEncoder struct{}
 
 func (e *defaultEncoder) encode(packet *Packet) ([]byte, error) {
-	buf := new(bytes.Buffer)
+	// buf := new(bytes.Buffer)
+	buf := GetBytesBuffer()
+	defer PutBytesBuffer(buf)
 
 	// 写入协议头
 	if err := binary.Write(buf, binary.BigEndian, packet.Header); err != nil {
@@ -56,18 +57,32 @@ func (d *defaultDecoder) decode(reader io.Reader) (*Packet, error) {
 		return nil, fmt.Errorf("packet too large: %d", header.Length)
 	}
 
-	// 读取数据
-	data := make([]byte, header.Length)
-	if _, err := io.ReadFull(reader, data); err != nil {
+	// 使用字节切片池读取数据
+	dataBuf := GetByteSlice()
+	defer PutByteSlice(dataBuf)
+
+	// 确保有足够容量
+	if cap(dataBuf) < int(header.Length) {
+		// 容量不足，创建新的切片
+		dataBuf = make([]byte, header.Length)
+	} else {
+		// 重用切片，设置正确长度
+		dataBuf = dataBuf[:header.Length]
+	}
+
+	if _, err := io.ReadFull(reader, dataBuf); err != nil {
 		return nil, err
 	}
+
+	// 创建数据副本（重要！因为池中的切片会被复用）
+	data := make([]byte, header.Length)
+	copy(data, dataBuf)
 
 	packet := &Packet{
 		Header: header,
 		Data:   data,
 	}
 
-	// 验证数据包
 	if !packet.validate() {
 		return nil, fmt.Errorf("packet validation failed")
 	}
