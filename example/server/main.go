@@ -2,28 +2,47 @@ package main
 
 import (
 	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/laazua/snet"
 )
 
 func main() {
 	// 设置服务器端TLS认证
-	// snet.SetServerAuth(
-	// 	"../certs/ssl/ca.crt",
-	// 	"../certs/ssl/server.crt",
-	// 	"../certs/ssl/server.key",
-	// )
-	handler := snet.HandlerFunc(StructHandler)
-	server := snet.NewServer(":8082").SetHandler(handler).SetWorkerPool(4, 1000)
+	snet.SetServerAuth(
+		"../certs/ssl/ca.crt",
+		"../certs/ssl/server.crt",
+		"../certs/ssl/server.key",
+	)
+
+	server := snet.NewServer(":8082").SetWorkerPool(4, 1000)
+
+	// 注册数据包处理函数(这里注册的数据包类型需要和客户端发送的数据包类型一致)
+	// server.AddHandlerFunc(snet.PacketTypeAuth, handleLogin)
+	// server.AddHandlerFunc(snet.PacketTypeChat, handleChat)
+	// server.AddHandlerFunc(snet.PacketTypeFile, handleFile)
+
+	server.AddHandlerFunc(snet.PacketTypeDataJson, JsonHandler)
+	server.AddHandlerFunc(snet.PacketTypeDataStruct, StructHandler)
+
 	// 注册信号处理函数
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 
 	// 启动服务器
-	if err := server.Start(); err != nil {
-		fmt.Println("Server error:", err)
-		return
-	}
+	go func() {
+		if err := server.Start(); err != nil {
+			fmt.Println("Server error:", err)
+			return
+		}
+	}()
 	// 监听信号以优雅关闭服务器
-	// server.Stop()
+	<-quit
+	log.Println("Shutting down server...")
+	server.Stop()
 }
 
 // json数据结构
@@ -44,7 +63,7 @@ func JsonHandler(conn *snet.Conn, packet *snet.Packet) {
 		"data":    nil,
 	}
 	responseData, _ := serializer.SerializeMap(resp)
-	responsePacket := snet.NewPacket(snet.PacketTypeData, responseData, packet.Header.Seq)
+	responsePacket := snet.NewPacket(snet.PacketTypeDataJson, responseData, packet.Header.Seq)
 	conn.SendPacket(responsePacket)
 }
 
@@ -70,6 +89,6 @@ func StructHandler(conn *snet.Conn, packet *snet.Packet) {
 		Age:  user.Age + 1,
 	}
 	responseData, _ := serializer.SerializeStruct(userResponse)
-	responsePacket := snet.NewPacket(snet.PacketTypeData, responseData, packet.Header.Seq)
+	responsePacket := snet.NewPacket(snet.PacketTypeDataStruct, responseData, packet.Header.Seq)
 	conn.SendPacket(responsePacket)
 }

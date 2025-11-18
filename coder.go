@@ -2,7 +2,6 @@ package snet
 
 import (
 	"encoding/binary"
-	"fmt"
 	"io"
 )
 
@@ -49,12 +48,12 @@ func (d *defaultDecoder) decode(reader io.Reader) (*Packet, error) {
 
 	// 验证魔数
 	if header.Magic != MagicNumber {
-		return nil, fmt.Errorf("invalid magic number")
+		return nil, ErrMagicNumberInvalid
 	}
 
 	// 验证数据长度
 	if header.Length > MaxPacketSize {
-		return nil, fmt.Errorf("packet too large: %d", header.Length)
+		return nil, ErrPacketTooLarge
 	}
 
 	// 使用字节切片池读取数据
@@ -84,7 +83,7 @@ func (d *defaultDecoder) decode(reader io.Reader) (*Packet, error) {
 	}
 
 	if !packet.validate() {
-		return nil, fmt.Errorf("packet validation failed")
+		return nil, ErrPacketIvalid
 	}
 
 	return packet, nil

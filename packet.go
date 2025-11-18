@@ -3,11 +3,11 @@ package snet
 import "hash/crc32"
 
 // 数据包类型
-const (
-	PacketTypeData = iota + 1
-	PacketTypeAck
-	PacketTypeHeartbeat
-)
+// const (
+// 	PacketTypeData = iota + 1
+// 	PacketTypeAck
+// 	PacketTypeHeartbeat
+// )
 
 // 协议常量
 const (
@@ -19,12 +19,12 @@ const (
 
 // 数据包协议头
 type packetHeader struct {
-	Magic    uint32 // 魔数，用于识别协议
-	Version  uint8  // 协议版本
-	Type     uint8  // 包类型
-	Length   uint32 // 数据长度
-	Checksum uint32 // CRC32校验和
-	Seq      uint32 // 序列号
+	Magic    uint32     // 魔数，用于识别协议
+	Version  uint8      // 协议版本
+	Type     PacketType // 包类型
+	Length   uint32     // 数据长度
+	Checksum uint32     // CRC32校验和
+	Seq      uint32     // 序列号
 }
 
 // Packet 数据包结构
@@ -34,7 +34,7 @@ type Packet struct {
 }
 
 // NewPacket 创建新数据包
-func NewPacket(packetType uint8, data []byte, seq uint32) *Packet {
+func NewPacket(packetType PacketType, data []byte, seq uint32) *Packet {
 	header := &packetHeader{
 		Magic:   MagicNumber,
 		Version: ProtocolVersion,

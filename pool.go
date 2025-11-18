@@ -1,7 +1,6 @@
 package snet
 
 import (
-	"fmt"
 	"sync"
 	"sync/atomic"
 )
@@ -40,14 +39,14 @@ func (p *WorkerPool) worker() {
 // Submit 提交任务
 func (p *WorkerPool) Submit(task func()) error {
 	if atomic.LoadInt32(&p.closed) == 1 {
-		return fmt.Errorf("worker pool is closed")
+		return ErrWorkerPoolClosed
 	}
 
 	select {
 	case p.taskQueue <- task:
 		return nil
 	default:
-		return fmt.Errorf("worker pool queue is full")
+		return ErrWorkerPoolQueueFull
 	}
 }
 

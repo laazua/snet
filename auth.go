@@ -3,7 +3,6 @@ package snet
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"fmt"
 	"log"
 	"os"
 )
@@ -45,7 +44,7 @@ func fileExists(filename string) bool {
 // 设置服务器端认证配置
 func SetServerAuth(caFile, crtFile, keyFile string) error {
 	if !fileExists(crtFile) || !fileExists(keyFile) || !fileExists(caFile) {
-		return fmt.Errorf("cert files do not exist")
+		return ErrCertFileNotFound
 	}
 	cert, certPool, err := load(caFile, crtFile, keyFile)
 	if err != nil {
@@ -62,7 +61,7 @@ func SetServerAuth(caFile, crtFile, keyFile string) error {
 // 设置客户端认证配置
 func SetClientAuth(caFile, crtFile, keyFile string) error {
 	if !fileExists(crtFile) || !fileExists(keyFile) || !fileExists(caFile) {
-		return fmt.Errorf("cert file not exists")
+		return ErrCertFileNotFound
 	}
 	cert, certPool, err := load(caFile, crtFile, keyFile)
 	if err != nil {
