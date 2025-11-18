@@ -4,7 +4,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"log/slog"
+	"log"
 	"net"
 	"sync"
 )
@@ -35,8 +35,8 @@ func (f HandlerFunc) Handle(conn *Conn, packet *Packet) {
 // NewServer 创建服务器
 func NewServer(addr string) *Server {
 	return &Server{
-		addr: addr,
-		// workerPool:  NewWorkerPool(workers, 1000),
+		addr:        addr,
+		workerPool:  newWorkerPool(100, 1000),
 		connManager: NewConnManager(),
 	}
 }
@@ -56,10 +56,10 @@ func (s *Server) Start() error {
 	var err error
 	var listener net.Listener
 	if serverAuthConfig != nil {
-		slog.Info("加载证书启动")
+		log.Println("加载证书启动")
 		listener, err = tls.Listen("tcp", s.addr, serverAuthConfig)
 	} else {
-		slog.Info("未加载证书启动")
+		log.Println("未加载证书启动")
 		listener, err = net.Listen("tcp", s.addr)
 	}
 	if err != nil {
@@ -77,7 +77,7 @@ func (s *Server) Start() error {
 	s.running = true
 	s.mu.Unlock()
 
-	fmt.Printf("Server started on %s\n", s.addr)
+	log.Printf("Server started on %s\n", s.addr)
 
 	for {
 		conn, err := listener.Accept()
