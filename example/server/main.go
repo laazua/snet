@@ -8,9 +8,17 @@ import (
 	"syscall"
 
 	"github.com/laazua/snet"
+
+	"net/http"
+	_ "net/http/pprof"
 )
 
 func main() {
+	// 启动 pprof 服务
+	// http://ip:8083/debug/pprof
+	go func() {
+		http.ListenAndServe(":8083", nil)
+	}()
 	// 设置服务器端TLS认证
 	snet.SetServerAuth(
 		"../certs/ssl/ca.crt",
@@ -18,7 +26,7 @@ func main() {
 		"../certs/ssl/server.key",
 	)
 
-	server := snet.NewServer(":8082").SetWorkerPool(4, 1000)
+	server := snet.NewServer(":8082").SetWorkerPool(100, 1000)
 
 	// 注册数据包处理函数(这里注册的数据包类型需要和客户端发送的数据包类型一致)
 	// server.AddHandlerFunc(snet.PacketTypeAuth, handleLogin)
